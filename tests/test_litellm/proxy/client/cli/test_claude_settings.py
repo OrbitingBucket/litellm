@@ -1,4 +1,5 @@
 import json
+import os
 import shlex
 import stat
 import time
@@ -9,14 +10,25 @@ from click.testing import CliRunner
 
 from litellm.litellm_core_utils.cli_token_utils import CliTokenRecord
 from litellm.proxy.client.cli import cli
+from litellm.litellm_core_utils.private_json import commit_staged_json
 from litellm.proxy.client.cli.commands.claude_settings import (
+    ANTHROPIC_DEFAULT_MODEL_ENV_KEYS,
     AUTOROUTE_BACKUP_PATH,
     BACKUP_PATH,
+    OWNED_ENV_KEYS,
+    OWNED_TOP_LEVEL_KEYS,
     SETTINGS_FILE_OWNERS,
+    ApiKeyHelper,
     ClaudeSettingsError,
+    KeepModel,
     SettingsFileOwner,
+    StartOn,
+    StaticToken,
+    UnpinModel,
+    configure_claude_settings,
+    merge_claude_settings,
     resolve_api_key_helper,
-    write_claude_settings,
+    unconfigure_claude_settings,
 )
 
 
@@ -97,17 +109,27 @@ def lite_on_path():
         yield
 
 
-class TestWriteClaudeSettings:
+
+def _helper_configure(base_url, settings_path, owners, state_path=None):
+    """`lite login --config-claude`'s shape: the login credential behind apiKeyHelper, no pinned model."""
+    state = state_path if state_path is not None else settings_path.parent.parent / "state.json"
+    root = base_url.rstrip("/")
+    configure_claude_settings(root, ApiKeyHelper(resolve_api_key_helper(root)), KeepModel(), settings_path, state, owners)
+
+
+class TestConfigureWithTheLoginHelper:
     def test_creates_the_file_and_its_parent_when_missing(self, paths, lite_on_path):
         settings_path, backup_path = paths
         assert not settings_path.parent.exists()
 
-        write_claude_settings("https://proxy.example.com/", settings_path, _owners(backup_path))
+        _helper_configure("https://proxy.example.com/", settings_path, _owners(backup_path))
 
         written = json.loads(settings_path.read_text())
         assert written["env"]["ANTHROPIC_BASE_URL"] == "https://proxy.example.com"
         assert written["env"]["ENABLE_TOOL_SEARCH"] == "true"
+        assert written["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
         assert written["apiKeyHelper"] == "/usr/local/bin/lite --base-url https://proxy.example.com auth print-token"
+        assert "model" not in written
 
     def test_updates_an_existing_file_preserving_unrelated_settings(self, paths, lite_on_path):
         settings_path, backup_path = paths
@@ -123,7 +145,7 @@ class TestWriteClaudeSettings:
             )
         )
 
-        write_claude_settings("https://proxy.example.com", settings_path, _owners(backup_path))
+        _helper_configure("https://proxy.example.com", settings_path, _owners(backup_path))
 
         written = json.loads(settings_path.read_text())
         assert written["theme"] == "dark"
@@ -135,26 +157,29 @@ class TestWriteClaudeSettings:
     def test_rerunning_against_a_new_proxy_refreshes_both_base_url_and_helper(self, paths, lite_on_path):
         settings_path, backup_path = paths
 
-        write_claude_settings("https://first.example.com", settings_path, _owners(backup_path))
-        write_claude_settings("https://second.example.com", settings_path, _owners(backup_path))
+        _helper_configure("https://first.example.com", settings_path, _owners(backup_path))
+        _helper_configure("https://second.example.com", settings_path, _owners(backup_path))
 
         written = json.loads(settings_path.read_text())
         assert written["env"]["ANTHROPIC_BASE_URL"] == "https://second.example.com"
         assert "second.example.com" in written["apiKeyHelper"]
         assert "first.example.com" not in written["apiKeyHelper"]
 
-    def test_drops_a_stray_static_api_key_so_the_helper_token_wins(self, paths, lite_on_path):
+    def test_drops_stray_static_credentials_so_the_helper_token_wins(self, paths, lite_on_path):
+        # Claude Code prefers ANTHROPIC_AUTH_TOKEN over apiKeyHelper, so a virtual key left behind
+        # by an earlier `lite configure claude --api-key` would silently keep winning.
         settings_path, backup_path = paths
         settings_path.parent.mkdir(parents=True)
-        settings_path.write_text(json.dumps({"env": {"ANTHROPIC_API_KEY": "sk-leaked"}}))
+        settings_path.write_text(json.dumps({"env": {"ANTHROPIC_API_KEY": "sk-leaked", "ANTHROPIC_AUTH_TOKEN": "sk-old"}}))
 
-        write_claude_settings("https://proxy.example.com", settings_path, _owners(backup_path))
+        _helper_configure("https://proxy.example.com", settings_path, _owners(backup_path))
 
-        assert "ANTHROPIC_API_KEY" not in json.loads(settings_path.read_text())["env"]
+        env = json.loads(settings_path.read_text())["env"]
+        assert "ANTHROPIC_API_KEY" not in env and "ANTHROPIC_AUTH_TOKEN" not in env
 
     def test_written_file_is_owner_only(self, paths, lite_on_path):
         settings_path, backup_path = paths
-        write_claude_settings("https://proxy.example.com", settings_path, _owners(backup_path))
+        _helper_configure("https://proxy.example.com", settings_path, _owners(backup_path))
         assert stat.S_IMODE(settings_path.stat().st_mode) == 0o600
 
     def test_refuses_while_lite_up_holds_a_backup(self, paths, lite_on_path):
@@ -162,7 +187,7 @@ class TestWriteClaudeSettings:
         backup_path.write_text("{}")
 
         with pytest.raises(ClaudeSettingsError, match="lite down"):
-            write_claude_settings("https://proxy.example.com", settings_path, _owners(backup_path))
+            _helper_configure("https://proxy.example.com", settings_path, _owners(backup_path))
 
         assert not settings_path.exists()
 
@@ -172,7 +197,7 @@ class TestWriteClaudeSettings:
         settings_path.write_text("not json at all {{{")
 
         with pytest.raises(ClaudeSettingsError, match="invalid JSON"):
-            write_claude_settings("https://proxy.example.com", settings_path, _owners(backup_path))
+            _helper_configure("https://proxy.example.com", settings_path, _owners(backup_path))
 
         assert settings_path.read_text() == "not json at all {{{"
 
@@ -180,7 +205,7 @@ class TestWriteClaudeSettings:
         settings_path, backup_path = paths
         with patch(f"{CLAUDE_SETTINGS_MODULE}.shutil.which", return_value=None):
             with pytest.raises(ClaudeSettingsError, match="Could not find `lite`"):
-                write_claude_settings("https://proxy.example.com", settings_path, _owners(backup_path))
+                _helper_configure("https://proxy.example.com", settings_path, _owners(backup_path))
 
         assert not settings_path.exists()
 
@@ -196,7 +221,7 @@ class TestWriteClaudeSettings:
         settings_path.write_bytes(b'{"theme": "\xff\xfe"}')
 
         with pytest.raises(ClaudeSettingsError, match="invalid JSON"):
-            write_claude_settings("https://proxy.example.com", settings_path, _owners(backup_path))
+            _helper_configure("https://proxy.example.com", settings_path, _owners(backup_path))
 
     def test_reports_an_actionable_error_when_the_file_cannot_be_read(self, paths, lite_on_path):
         """An unreadable settings file must not surface as "Authentication failed".
@@ -210,16 +235,18 @@ class TestWriteClaudeSettings:
         settings_path.mkdir()
 
         with pytest.raises(ClaudeSettingsError, match="Could not read"):
-            write_claude_settings("https://proxy.example.com", settings_path, _owners(backup_path))
+            _helper_configure("https://proxy.example.com", settings_path, _owners(backup_path))
 
     def test_reports_an_actionable_error_when_the_file_cannot_be_written(self, paths, lite_on_path):
         settings_path, backup_path = paths
-        with patch(
-            f"{CLAUDE_SETTINGS_MODULE}.write_private_json",
-            side_effect=OSError("Read-only file system"),
-        ):
-            with pytest.raises(ClaudeSettingsError, match="Read-only file system"):
-                write_claude_settings("https://proxy.example.com", settings_path, _owners(backup_path))
+        settings_path.parent.mkdir(parents=True)
+        settings_path.parent.chmod(0o500)
+        try:
+            with pytest.raises(ClaudeSettingsError, match="Could not write"):
+                _helper_configure("https://proxy.example.com", settings_path, _owners(backup_path))
+        finally:
+            settings_path.parent.chmod(0o700)
+        assert not settings_path.exists()
 
 
 class TestApiKeyHelperIsActuallyInvocable:
@@ -288,6 +315,7 @@ class TestApiKeyHelperIsActuallyInvocable:
         assert "Not authenticated for this server" in result.output
 
 
+
 class TestConflictingOwnersOfTheSettingsFile:
     """Both `lite up` and `lite autoroute up` restore a backup when they stop.
 
@@ -303,7 +331,7 @@ class TestConflictingOwnersOfTheSettingsFile:
             backup.write_text("{}")
             stand_in = SettingsFileOwner(backup, owner.start_command, owner.stop_command)
             with pytest.raises(ClaudeSettingsError, match="currently managing"):
-                write_claude_settings("https://proxy.example.com", settings_path, (stand_in,))
+                _helper_configure("https://proxy.example.com", settings_path, (stand_in,))
             backup.unlink()
             assert not settings_path.exists()
 
@@ -314,9 +342,9 @@ class TestConflictingOwnersOfTheSettingsFile:
         autoroute = SettingsFileOwner(backup, "lite autoroute up", "lite autoroute down")
 
         with pytest.raises(ClaudeSettingsError, match="`lite autoroute up` is currently managing"):
-            write_claude_settings("https://proxy.example.com", settings_path, (autoroute,))
+            _helper_configure("https://proxy.example.com", settings_path, (autoroute,))
         with pytest.raises(ClaudeSettingsError, match="Run `lite autoroute down` first"):
-            write_claude_settings("https://proxy.example.com", settings_path, (autoroute,))
+            _helper_configure("https://proxy.example.com", settings_path, (autoroute,))
 
     def test_the_registry_matches_the_paths_the_commands_actually_use(self):
         """A second definition of the autoroute dir must not drift from this one."""
@@ -341,7 +369,7 @@ class TestDoesNotDestroyUserOwnedStructure:
         link.parent.mkdir()
         link.symlink_to(real)
 
-        write_claude_settings("https://proxy.example.com", link, ())
+        _helper_configure("https://proxy.example.com", link, ())
 
         assert link.is_symlink()
         assert json.loads(real.read_text())["env"]["ANTHROPIC_BASE_URL"] == "https://proxy.example.com"
@@ -354,6 +382,337 @@ class TestDoesNotDestroyUserOwnedStructure:
         settings_path.write_text(json.dumps({"theme": "dark", "env": "not-an-object"}))
 
         with pytest.raises(ClaudeSettingsError, match="non-object"):
-            write_claude_settings("https://proxy.example.com", settings_path, _owners(backup_path))
+            _helper_configure("https://proxy.example.com", settings_path, _owners(backup_path))
 
         assert json.loads(settings_path.read_text())["env"] == "not-an-object"
+
+
+class TestMergeClaudeSettings:
+    """One merge for every way Claude Code gets wired: `lite up`, `lite login --config-claude`,
+    `lite configure claude` and `lite autoroute up`."""
+
+    def test_a_static_token_lands_in_env_and_the_helper_slot_is_cleared(self):
+        settings = {"apiKeyHelper": "/usr/local/bin/lite auth print-token", "env": {"ANTHROPIC_API_KEY": "leaked"}}
+        merged = merge_claude_settings(settings, "http://127.0.0.1:4000/", StaticToken("token-abc"))
+        assert merged["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:4000"
+        assert merged["env"]["ANTHROPIC_AUTH_TOKEN"] == "token-abc"
+        assert merged["env"]["ENABLE_TOOL_SEARCH"] == "true"
+        assert merged["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+        assert "ANTHROPIC_API_KEY" not in merged["env"]
+        assert "apiKeyHelper" not in merged
+        assert "model" not in merged
+        assert not any(key in merged["env"] for key in ANTHROPIC_DEFAULT_MODEL_ENV_KEYS)
+
+    def test_a_helper_lands_top_level_and_the_static_slots_are_cleared(self):
+        settings = {"env": {"ANTHROPIC_AUTH_TOKEN": "sk-old", "ANTHROPIC_API_KEY": "leaked"}}
+        merged = merge_claude_settings(settings, "http://127.0.0.1:4000", ApiKeyHelper("lite auth print-token"))
+        assert merged["apiKeyHelper"] == "lite auth print-token"
+        assert "ANTHROPIC_AUTH_TOKEN" not in merged["env"] and "ANTHROPIC_API_KEY" not in merged["env"]
+
+    def test_keeps_existing_switch_values_and_unrelated_keys_without_mutating_the_input(self):
+        settings = {"theme": "dark", "env": {"SOME_OTHER_VAR": "value", "ENABLE_TOOL_SEARCH": "false"}}
+        merged = merge_claude_settings(settings, "http://127.0.0.1:4000", StaticToken("token-abc"))
+        assert merged["theme"] == "dark"
+        assert merged["env"]["SOME_OTHER_VAR"] == "value"
+        assert merged["env"]["ENABLE_TOOL_SEARCH"] == "false"
+        assert settings == {"theme": "dark", "env": {"SOME_OTHER_VAR": "value", "ENABLE_TOOL_SEARCH": "false"}}
+
+    def test_a_default_model_sets_only_the_row_claude_code_starts_on(self):
+        merged = merge_claude_settings({}, "http://127.0.0.1:4000", StaticToken("token-abc"), default_model="claude-auto")
+        assert merged["model"] == "claude-auto"
+        assert not any(key in merged["env"] for key in ANTHROPIC_DEFAULT_MODEL_ENV_KEYS)
+
+    def test_a_tier_model_forces_every_claude_code_tier_as_autoroute_needs(self):
+        # Router's auto-router registry is keyed by the literal requested model string with no
+        # wildcard resolution, so `lite autoroute up` overrides the env var each tier reads.
+        settings = {"env": {"ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-opus-4-8"}}
+        merged = merge_claude_settings(settings, "http://127.0.0.1:4000", StaticToken("token-abc"), tier_model="autorouter")
+        assert {merged["env"][key] for key in ANTHROPIC_DEFAULT_MODEL_ENV_KEYS} == {"autorouter"}
+        assert "model" not in merged
+
+    def test_touches_exactly_the_declared_owned_keys(self):
+        # The receipt and unconfigure restore exactly OWNED_*_KEYS, so a key the merge writes outside
+        # that table would be written by configure and never undone.
+        settings = {
+            "theme": "dark",
+            "permissions": {"allow": ["Bash"]},
+            "env": {"KEEP_ME": "1", "ANTHROPIC_API_KEY": "old", "ENABLE_TOOL_SEARCH": "false"},
+            "apiKeyHelper": "old-helper",
+            "model": "old-model",
+        }
+        for credential in (StaticToken("token-abc"), ApiKeyHelper("helper")):
+            merged = merge_claude_settings(settings, "http://127.0.0.1:4000", credential, default_model="claude-auto")
+            changed_top_level = {key for key in set(settings) | set(merged) if settings.get(key) != merged.get(key)}
+            assert changed_top_level - {"env"} <= set(OWNED_TOP_LEVEL_KEYS)
+            changed_env = {
+                key
+                for key in set(settings["env"]) | set(merged["env"])
+                if settings["env"].get(key) != merged["env"].get(key)
+            }
+            assert changed_env <= set(OWNED_ENV_KEYS)
+            assert merged["permissions"] == {"allow": ["Bash"]}
+            assert merged["env"]["KEEP_ME"] == "1"
+
+
+class TestConfigureAndUnconfigure:
+    """`configure_claude_settings` records how to undo itself; `unconfigure_claude_settings` undoes only that."""
+
+    ORIGINAL = {
+        "theme": "dark",
+        "permissions": {"allow": ["Bash"]},
+        "env": {"KEEP_ME": "1", "ANTHROPIC_API_KEY": "sk-ant-mine", "ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+        "apiKeyHelper": "/usr/local/bin/lite auth print-token",
+        "model": "claude-opus-5",
+    }
+
+    @pytest.fixture
+    def state_path(self, tmp_path):
+        return tmp_path / "state" / "claude_configure_state.json"
+
+    def _configure(self, paths, state_path, model="claude-auto", credential=StaticToken("sk-virtual-key"), owners=()):
+        settings_path, _ = paths
+        choice = StartOn(model) if model is not None else UnpinModel()
+        configure_claude_settings("http://127.0.0.1:4000", credential, choice, settings_path, state_path, owners)
+
+    def test_configure_then_unconfigure_returns_the_file_to_its_original_content(self, paths, state_path):
+        settings_path, _ = paths
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_text(json.dumps(self.ORIGINAL))
+
+        self._configure(paths, state_path)
+        configured = json.loads(settings_path.read_text())
+        assert configured["env"]["ANTHROPIC_AUTH_TOKEN"] == "sk-virtual-key"
+        assert configured["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:4000"
+        assert configured["model"] == "claude-auto"
+        assert "ANTHROPIC_API_KEY" not in configured["env"]
+        assert "apiKeyHelper" not in configured
+        assert stat.S_IMODE(settings_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+
+        outcome = unconfigure_claude_settings(settings_path, state_path, ())
+        assert json.loads(settings_path.read_text()) == self.ORIGINAL
+        assert not state_path.exists()
+        assert outcome.kept == ()
+        assert "env.ANTHROPIC_API_KEY" in outcome.restored and "apiKeyHelper" in outcome.restored
+
+    def test_the_receipt_never_holds_the_key_it_wrote(self, paths, state_path):
+        self._configure(paths, state_path, credential=StaticToken("sk-virtual-key-never-on-disk-twice"))
+        assert "sk-virtual-key-never-on-disk-twice" not in state_path.read_text()
+
+    @pytest.mark.parametrize(
+        ("original", "restored"),
+        [
+            (None, None),
+            ({"theme": "dark"}, {"theme": "dark"}),
+            ({"theme": "dark", "env": None}, {"theme": "dark", "env": None}),
+            ({"theme": "dark", "env": {}}, {"theme": "dark", "env": {}}),
+        ],
+        ids=["no-file", "no-env", "null-env", "empty-env"],
+    )
+    def test_unconfigure_restores_the_file_and_env_shapes_it_found(self, paths, state_path, original, restored):
+        settings_path, _ = paths
+        if original is not None:
+            settings_path.parent.mkdir(parents=True)
+            settings_path.write_text(json.dumps(original))
+        self._configure(paths, state_path)
+        unconfigure_claude_settings(settings_path, state_path, ())
+        if restored is None:
+            assert not settings_path.exists()
+        else:
+            assert json.loads(settings_path.read_text()) == restored
+
+    def test_unconfigure_leaves_keys_the_user_changed_since_and_names_them(self, paths, state_path):
+        settings_path, _ = paths
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_text(json.dumps(self.ORIGINAL))
+        self._configure(paths, state_path)
+        edited = json.loads(settings_path.read_text())
+        edited["env"]["ENABLE_TOOL_SEARCH"] = "false"
+        edited["model"] = "claude-sonnet-4-6"
+        settings_path.write_text(json.dumps(edited))
+
+        outcome = unconfigure_claude_settings(settings_path, state_path, ())
+        after = json.loads(settings_path.read_text())
+        assert after["env"]["ENABLE_TOOL_SEARCH"] == "false"
+        assert after["model"] == "claude-sonnet-4-6"
+        assert after["env"]["ANTHROPIC_BASE_URL"] == self.ORIGINAL["env"]["ANTHROPIC_BASE_URL"]
+        assert after["env"]["ANTHROPIC_API_KEY"] == "sk-ant-mine"
+        assert "ANTHROPIC_AUTH_TOKEN" not in after["env"]
+        assert after["apiKeyHelper"] == self.ORIGINAL["apiKeyHelper"]
+        assert set(outcome.kept) == {"env.ENABLE_TOOL_SEARCH", "model"}
+        assert outcome.withheld == ()
+
+    def test_credentials_stay_removed_when_the_base_url_was_changed_after_configure(self, paths, state_path):
+        # The old ANTHROPIC_API_KEY and apiKeyHelper belong to https://api.anthropic.com; putting them back
+        # next to a URL the user has since pointed elsewhere would send them to that server.
+        settings_path, _ = paths
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_text(json.dumps(self.ORIGINAL))
+        self._configure(paths, state_path)
+        edited = json.loads(settings_path.read_text())
+        edited["env"]["ANTHROPIC_BASE_URL"] = "http://other-proxy:4000"
+        settings_path.write_text(json.dumps(edited))
+
+        outcome = unconfigure_claude_settings(settings_path, state_path, ())
+        after = json.loads(settings_path.read_text())
+        assert after["env"]["ANTHROPIC_BASE_URL"] == "http://other-proxy:4000"
+        assert "ANTHROPIC_API_KEY" not in after["env"] and "ANTHROPIC_AUTH_TOKEN" not in after["env"]
+        assert "apiKeyHelper" not in after
+        assert after["model"] == self.ORIGINAL["model"] and after["env"]["KEEP_ME"] == "1"
+        assert set(outcome.withheld) == {"env.ANTHROPIC_API_KEY", "apiKeyHelper"}
+        assert "env.ANTHROPIC_API_KEY" not in outcome.restored and "apiKeyHelper" not in outcome.restored
+        assert outcome.kept == ("env.ANTHROPIC_BASE_URL",)
+
+    def test_a_credential_the_user_changed_is_kept_not_also_reported_withheld(self, paths, state_path):
+        # Kept and withheld are disjoint: a slot the user edited after configure is theirs and stays,
+        # and the report must not also claim it was left removed.
+        settings_path, _ = paths
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_text(json.dumps(self.ORIGINAL))
+        self._configure(paths, state_path)
+        edited = json.loads(settings_path.read_text())
+        edited["env"]["ANTHROPIC_BASE_URL"] = "http://other-proxy:4000"
+        edited["apiKeyHelper"] = "/opt/mine/helper"
+        settings_path.write_text(json.dumps(edited))
+
+        outcome = unconfigure_claude_settings(settings_path, state_path, ())
+        after = json.loads(settings_path.read_text())
+        assert after["apiKeyHelper"] == "/opt/mine/helper"
+        assert "ANTHROPIC_API_KEY" not in after["env"]
+        assert set(outcome.withheld) == {"env.ANTHROPIC_API_KEY"}
+        assert set(outcome.kept) == {"env.ANTHROPIC_BASE_URL", "apiKeyHelper"}
+        assert not set(outcome.withheld) & set(outcome.kept)
+
+    def test_an_env_the_user_filled_after_configure_created_it_is_kept(self, paths, state_path):
+        settings_path, _ = paths
+        self._configure(paths, state_path)
+        edited = json.loads(settings_path.read_text())
+        edited["env"]["MY_VAR"] = "mine"
+        settings_path.write_text(json.dumps(edited))
+        unconfigure_claude_settings(settings_path, state_path, ())
+        assert json.loads(settings_path.read_text()) == {"env": {"MY_VAR": "mine"}}
+
+    def test_a_repeat_configure_keeps_the_original_snapshot_across_credential_kinds(self, paths, state_path):
+        settings_path, _ = paths
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_text(json.dumps(self.ORIGINAL))
+        self._configure(paths, state_path, model="claude-auto")
+        self._configure(paths, state_path, model=None, credential=ApiKeyHelper("lite auth print-token"))
+        between = json.loads(settings_path.read_text())
+        assert between["apiKeyHelper"] == "lite auth print-token" and "ANTHROPIC_AUTH_TOKEN" not in between["env"]
+        self._configure(paths, state_path, model="claude-sonnet-4-6", credential=StaticToken("sk-rotated"))
+        assert json.loads(settings_path.read_text())["env"]["ANTHROPIC_AUTH_TOKEN"] == "sk-rotated"
+        unconfigure_claude_settings(settings_path, state_path, ())
+        assert json.loads(settings_path.read_text()) == self.ORIGINAL
+
+    @pytest.mark.parametrize("users_own_model", [None, "claude-opus-5"], ids=["no-model-before", "own-model-before"])
+    def test_a_repeat_configure_without_a_model_lets_go_of_the_pin_it_made(self, paths, state_path, users_own_model):
+        settings_path, _ = paths
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_text(json.dumps({"model": users_own_model} if users_own_model else {}))
+        self._configure(paths, state_path, model="claude-auto")
+        self._configure(paths, state_path, model=None, credential=StaticToken("sk-rotated"))
+        after = json.loads(settings_path.read_text())
+        assert after.get("model") == users_own_model
+        assert after["env"]["ANTHROPIC_AUTH_TOKEN"] == "sk-rotated"
+        unconfigure_claude_settings(settings_path, state_path, ())
+        assert json.loads(settings_path.read_text()) == ({"model": users_own_model} if users_own_model else {})
+
+    def test_a_relogin_keeps_the_model_configure_pinned(self, paths, state_path):
+        # `lite login --config-claude` only swaps the credential; it must not undo `--model`.
+        settings_path, _ = paths
+        self._configure(paths, state_path, model="claude-auto")
+        configure_claude_settings(
+            "http://127.0.0.1:4000", ApiKeyHelper("lite auth print-token"), KeepModel(), settings_path, state_path, ()
+        )
+        after = json.loads(settings_path.read_text())
+        assert after["model"] == "claude-auto" and after["apiKeyHelper"] == "lite auth print-token"
+        unconfigure_claude_settings(settings_path, state_path, ())
+        assert not settings_path.exists()
+
+    def test_a_failed_repeat_configure_leaves_the_earlier_undo_intact(self, paths, state_path):
+        # Both files are staged before either lands, so a settings write that fails on the second
+        # configure cannot replace the receipt with fingerprints of settings that never landed.
+        settings_path, _ = paths
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_text(json.dumps(self.ORIGINAL))
+        self._configure(paths, state_path)
+        receipt_before = state_path.read_text()
+        settings_path.parent.chmod(0o500)
+        try:
+            with pytest.raises(ClaudeSettingsError, match="Could not write"):
+                self._configure(paths, state_path, credential=StaticToken("sk-rotated"))
+        finally:
+            settings_path.parent.chmod(0o700)
+        assert state_path.read_text() == receipt_before
+        assert json.loads(settings_path.read_text())["env"]["ANTHROPIC_AUTH_TOKEN"] == "sk-virtual-key"
+        assert not list(state_path.parent.glob(".tmp-*"))
+        unconfigure_claude_settings(settings_path, state_path, ())
+        assert json.loads(settings_path.read_text()) == self.ORIGINAL
+
+    @pytest.mark.parametrize("configured_before", [False, True], ids=["first-configure", "repeat-configure"])
+    def test_a_settings_commit_that_fails_after_the_receipt_landed_puts_the_receipt_back(
+        self, paths, state_path, configured_before
+    ):
+        # Staging makes neither rename fail for space or permissions, but they are still two
+        # renames: a settings rename that fails after the receipt landed must not leave a receipt
+        # describing settings that were never written.
+        settings_path, _ = paths
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_text(json.dumps(self.ORIGINAL))
+        if configured_before:
+            self._configure(paths, state_path)
+        receipt_before = state_path.read_text() if configured_before else None
+        settings_before = settings_path.read_text()
+
+        def commit_settings_fails(staged, path):
+            if path == str(settings_path):
+                os.unlink(staged)
+                raise OSError("rename failed")
+            commit_staged_json(staged, path)
+
+        with pytest.raises(ClaudeSettingsError, match="rename failed"):
+            configure_claude_settings(
+                "http://127.0.0.1:4000",
+                StaticToken("sk-rotated"),
+                StartOn("claude-sonnet-4-6"),
+                settings_path,
+                state_path,
+                (),
+                commit=commit_settings_fails,
+            )
+        assert settings_path.read_text() == settings_before
+        if configured_before:
+            assert state_path.read_text() == receipt_before
+            unconfigure_claude_settings(settings_path, state_path, ())
+            assert json.loads(settings_path.read_text()) == self.ORIGINAL
+        else:
+            assert not state_path.exists()
+
+    def test_configure_writes_through_a_symlinked_settings_file(self, tmp_path, state_path):
+        target = tmp_path / "dotfiles" / "settings.json"
+        target.parent.mkdir()
+        target.write_text(json.dumps({"theme": "dark"}))
+        link = tmp_path / "settings.json"
+        link.symlink_to(target)
+        configure_claude_settings("http://127.0.0.1:4000", StaticToken("sk-virtual-key"), UnpinModel(), link, state_path, ())
+        assert link.is_symlink()
+        assert json.loads(target.read_text())["env"]["ANTHROPIC_AUTH_TOKEN"] == "sk-virtual-key"
+
+    @pytest.mark.parametrize("operation", ["configure", "unconfigure"])
+    def test_refuses_while_a_temporary_owner_holds_a_backup(self, paths, state_path, operation):
+        settings_path, backup_path = paths
+        backup_path.write_text("{}")
+        attempt = (
+            (lambda: self._configure(paths, state_path, owners=_owners(backup_path)))
+            if operation == "configure"
+            else (lambda: unconfigure_claude_settings(settings_path, state_path, _owners(backup_path)))
+        )
+        with pytest.raises(ClaudeSettingsError, match="lite down"):
+            attempt()
+        assert not settings_path.exists()
+
+    def test_unconfigure_without_a_receipt_is_an_error_not_a_silent_no_op(self, paths, state_path):
+        settings_path, _ = paths
+        with pytest.raises(ClaudeSettingsError, match="nothing to undo"):
+            unconfigure_claude_settings(settings_path, state_path, ())

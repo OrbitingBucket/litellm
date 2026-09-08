@@ -27,6 +27,7 @@ from litellm.proxy.client.cli.commands.auth import (
     print_token,
     whoami,
 )
+from litellm.proxy.client.cli.commands import auth as auth_module
 from litellm.proxy.client.cli.commands.claude_settings import SettingsFileOwner
 
 
@@ -1398,8 +1399,10 @@ class TestLoginConfigClaude:
     def setup_method(self):
         self.runner = CliRunner()
 
-    def _run_login(self, tmp_path, args, base_url="https://test.example.com"):
+    def _run_login(self, tmp_path, monkeypatch, args, base_url="https://test.example.com"):
         settings_path = tmp_path / "claude" / "settings.json"
+        monkeypatch.setattr(auth_module, "CLAUDE_SETTINGS_PATH", settings_path)
+        monkeypatch.setattr(auth_module, "CONFIGURE_STATE_PATH", tmp_path / "claude_configure_state.json")
         backup_path = tmp_path / "claude_settings_backup.json"
         poll_response = Mock()
         poll_response.status_code = 200
@@ -1416,7 +1419,6 @@ class TestLoginConfigClaude:
             patch("requests.get", return_value=poll_response),
             patch("litellm.proxy.client.cli.commands.auth.save_cli_token"),
             patch("litellm.proxy.client.cli.interface.show_commands"),
-            patch("litellm.proxy.client.cli.commands.auth.CLAUDE_SETTINGS_PATH", settings_path),
             patch(
                 "litellm.proxy.client.cli.commands.auth.SETTINGS_FILE_OWNERS",
                 (SettingsFileOwner(backup_path, "lite up", "lite down"),),
@@ -1429,16 +1431,16 @@ class TestLoginConfigClaude:
             result = self.runner.invoke(login, args, obj={"base_url": base_url})
         return result, settings_path, backup_path
 
-    def test_default_login_does_not_touch_claude_settings(self, tmp_path):
-        result, settings_path, _backup_path = self._run_login(tmp_path, [])
+    def test_default_login_does_not_touch_claude_settings(self, tmp_path, monkeypatch):
+        result, settings_path, _backup_path = self._run_login(tmp_path, monkeypatch, [])
 
         assert result.exit_code == 0
         assert "Login successful!" in result.output
         assert not settings_path.exists()
         assert "Configured Claude Code" not in result.output
 
-    def test_flag_writes_the_settings_file_and_reports_success(self, tmp_path):
-        result, settings_path, _backup_path = self._run_login(tmp_path, ["--config-claude"])
+    def test_flag_writes_the_settings_file_and_reports_success(self, tmp_path, monkeypatch):
+        result, settings_path, _backup_path = self._run_login(tmp_path, monkeypatch, ["--config-claude"])
 
         assert result.exit_code == 0
         written = json.loads(settings_path.read_text())
@@ -1447,24 +1449,24 @@ class TestLoginConfigClaude:
         assert written["apiKeyHelper"] == "/usr/local/bin/lite --base-url https://test.example.com auth print-token"
         assert "Configured Claude Code" in result.output
 
-    def test_flag_preserves_unrelated_settings_on_an_existing_file(self, tmp_path):
+    def test_flag_preserves_unrelated_settings_on_an_existing_file(self, tmp_path, monkeypatch):
         settings_path = tmp_path / "claude" / "settings.json"
         settings_path.parent.mkdir(parents=True)
         settings_path.write_text(json.dumps({"theme": "dark", "env": {"KEEP": "me"}}))
 
-        result, _settings_path, _backup_path = self._run_login(tmp_path, ["--config-claude"])
+        result, _settings_path, _backup_path = self._run_login(tmp_path, monkeypatch, ["--config-claude"])
 
         assert result.exit_code == 0
         written = json.loads(settings_path.read_text())
         assert written["theme"] == "dark"
         assert written["env"]["KEEP"] == "me"
 
-    def test_settings_failure_is_reported_without_claiming_login_failed(self, tmp_path):
+    def test_settings_failure_is_reported_without_claiming_login_failed(self, tmp_path, monkeypatch):
         settings_path = tmp_path / "claude" / "settings.json"
         settings_path.parent.mkdir(parents=True)
         settings_path.write_text("not json at all {{{")
 
-        result, _settings_path, _backup_path = self._run_login(tmp_path, ["--config-claude"])
+        result, _settings_path, _backup_path = self._run_login(tmp_path, monkeypatch, ["--config-claude"])
 
         assert result.exit_code != 0
         assert "Login successful!" in result.output

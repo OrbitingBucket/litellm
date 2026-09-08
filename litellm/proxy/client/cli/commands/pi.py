@@ -25,6 +25,7 @@ LITELLM_PROXY_API_KEY_ENV: Final = "LITELLM_PROXY_API_KEY"
 @dataclass(frozen=True, slots=True)
 class PiSyncError:
     message: str
+    status: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,14 +68,16 @@ def fetch_model_ids(
     except requests.RequestException as e:
         return PiSyncError(f"Could not list models from the proxy: {e}")
     if resp.status_code != 200:
-        return PiSyncError(f"The proxy returned HTTP {resp.status_code} for /v1/models; cannot build pi's model list.")
+        return PiSyncError(
+            f"The proxy returned HTTP {resp.status_code} for /v1/models; cannot list models.", resp.status_code
+        )
     try:
         listing: Final = _ModelList.model_validate(resp.json())
     except (ValueError, ValidationError) as e:
         return PiSyncError(f"Unexpected /v1/models response from the proxy: {e}")
     ids: Final = tuple(dict.fromkeys(model.id for model in listing.data))
     if not ids:
-        return PiSyncError("The proxy returned no models for your key, so pi would have nothing to run.")
+        return PiSyncError("The proxy returned no models for your key, so there is nothing to run.")
     return ids
 
 
