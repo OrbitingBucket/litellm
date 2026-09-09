@@ -501,7 +501,7 @@ def run_agent(
     launcher(binary, [command[0], *extra_args, *command[1:]], env)
 
 
-def _is_interactive() -> bool:
+def is_interactive() -> bool:
     return sys.stdin.isatty()
 
 
@@ -512,7 +512,7 @@ def resolve_api_key(ctx: click.Context) -> str:
     if api_key:
         return api_key
 
-    if not _is_interactive():
+    if not is_interactive():
         raise click.ClickException(
             "No LiteLLM key found. Set LITELLM_PROXY_API_KEY (or pass --api-key) for "
             "non-interactive use, or run `lite login` from a terminal."
@@ -529,15 +529,23 @@ def resolve_api_key(ctx: click.Context) -> str:
 _SKIP_VERIFY_HELP: Final = "Skip the pre-launch key check against the proxy."
 
 
-def _launch(ctx: click.Context, binary: str, args: Sequence[str], *, skip_verify: bool) -> None:
-    ctx_obj: Final[CliContextObj] = ctx.obj
-    base_url: Final = ctx_obj["base_url"]
-    started_interactive: Final = _is_interactive()
-    api_key: Final = resolve_api_key(ctx)
+def launch_agent(
+    base_url: str,
+    api_key: str,
+    binary: str,
+    args: Sequence[str] = (),
+    *,
+    skip_verify: bool = False,
+    started_interactive: bool,
+) -> None:
+    """Announce, then hand the process off to the agent; never returns on success.
 
+    `started_interactive` is whether stdin was a tty when the command began, sampled by the caller
+    BEFORE anything that can run a browser login: a login detaches stdin, and the terminal has to
+    be reattached exactly in that case, which a sample taken afterwards can no longer tell apart.
+    """
     display_name, _ = agent_profile(binary)
     click.echo(f"litellm: routing {display_name} through proxy at {base_url.rstrip('/')}")
-
     try:
         run_agent(
             base_url,
@@ -548,6 +556,19 @@ def _launch(ctx: click.Context, binary: str, args: Sequence[str], *, skip_verify
         )
     except AgentRunError as e:
         raise click.ClickException(str(e))
+
+
+def _launch(ctx: click.Context, binary: str, args: Sequence[str], *, skip_verify: bool) -> None:
+    ctx_obj: Final[CliContextObj] = ctx.obj
+    started_interactive: Final = is_interactive()
+    launch_agent(
+        ctx_obj["base_url"],
+        resolve_api_key(ctx),
+        binary,
+        args,
+        skip_verify=skip_verify,
+        started_interactive=started_interactive,
+    )
 
 
 def _make_agent_command(binary: str, display_name: str) -> click.Command:
@@ -586,6 +607,8 @@ __all__ = [
     "agent_model_sync_env",
     "agent_profile",
     "build_agent_env",
+    "is_interactive",
+    "launch_agent",
     "opencode_model_sync_env",
     "opencode_provider_config",
     "prepare_pi",

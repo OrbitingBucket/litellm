@@ -1100,7 +1100,7 @@ class TestAgentCommands:
 
     def test_non_interactive_without_key_errors_clearly(self):
         with (
-            patch(f"{AGENTS_MODULE}._is_interactive", return_value=False),
+            patch(f"{AGENTS_MODULE}.is_interactive", return_value=False),
             patch(f"{AGENTS_MODULE}.run_agent") as mock_run,
         ):
             result = self.runner.invoke(
@@ -1121,7 +1121,7 @@ class TestAgentCommands:
             pass
 
         with (
-            patch(f"{AGENTS_MODULE}._is_interactive", return_value=True),
+            patch(f"{AGENTS_MODULE}.is_interactive", return_value=True),
             patch(f"{AGENTS_MODULE}.login", fake_login),
             patch(
                 f"{AGENTS_MODULE}.get_stored_api_key", return_value="sk-after-login"
@@ -1172,7 +1172,7 @@ class TestAgentCommands:
 
         captured = {}
         with (
-            patch(f"{AGENTS_MODULE}._is_interactive", return_value=True),
+            patch(f"{AGENTS_MODULE}.is_interactive", return_value=True),
             patch(
                 f"{AGENTS_MODULE}.run_agent",
                 side_effect=lambda b, k, c, **kw: captured.update(kw),
@@ -1189,7 +1189,7 @@ class TestAgentCommands:
     def test_non_interactive_agent_mode_leaves_stdin_alone(self):
         captured = {}
         with (
-            patch(f"{AGENTS_MODULE}._is_interactive", return_value=False),
+            patch(f"{AGENTS_MODULE}.is_interactive", return_value=False),
             patch(
                 f"{AGENTS_MODULE}.run_agent",
                 side_effect=lambda b, k, c, **kw: captured.update(kw),

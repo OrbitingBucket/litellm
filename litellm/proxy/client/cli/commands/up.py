@@ -124,7 +124,14 @@ def _stored_login_is_pkce(vault: SecretVault) -> bool:
     return token_data is not None and token_data.get("refresh_token") is not None
 
 
-def ensure_fresh_login(ctx: click.Context) -> None:
+def ensure_fresh_login(
+    ctx: click.Context, reader: str = "apiKeyHelper reads this token on every Claude Code request"
+) -> None:
+    """Make sure a `lite login` credential the agent will read on demand is stored and fresh.
+
+    `reader` names, for the error, who will read the token; `lite up` and `--config-claude` are
+    Claude Code's apiKeyHelper, Codex's provider auth command is another.
+    """
     ctx_obj: Final[CliContextObj] = ctx.obj
     base_url: Final = ctx_obj["base_url"].rstrip("/")
     vault: Final = context_secret_vault(ctx)
@@ -134,10 +141,7 @@ def ensure_fresh_login(ctx: click.Context) -> None:
     pkce: Final = _stored_login_is_pkce(vault)
     login_command: Final = "lite login --pkce" if pkce else "lite login"
     if not sys.stdin.isatty():
-        raise UpError(
-            f"No fresh LiteLLM login found for this proxy. Run `{login_command}` first (apiKeyHelper "
-            "reads this token on every Claude Code request)."
-        )
+        raise UpError(f"No fresh LiteLLM login found for this proxy. Run `{login_command}` first ({reader}).")
 
     click.echo("No fresh LiteLLM login found for this proxy; starting login...")
     ctx.invoke(login, pkce=pkce)

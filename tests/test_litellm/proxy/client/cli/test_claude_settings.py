@@ -12,6 +12,7 @@ from litellm.litellm_core_utils.cli_token_utils import CliTokenRecord
 from litellm.proxy.client.cli import cli
 from litellm.litellm_core_utils.private_json import commit_staged_json
 from litellm.proxy.client.cli.commands.claude_settings import (
+    claude_config_dir,
     ANTHROPIC_DEFAULT_MODEL_ENV_KEYS,
     AUTOROUTE_BACKUP_PATH,
     BACKUP_PATH,
@@ -689,6 +690,61 @@ class TestConfigureAndUnconfigure:
         else:
             assert not state_path.exists()
 
+    def test_a_receipt_commit_that_fails_leaves_no_staged_settings_behind(self, paths, state_path):
+        # The staged settings file carries the key; a receipt rename that fails must not orphan it beside
+        # the real settings.json, and the failure must surface as the settings error the CLI maps.
+        settings_path, _ = paths
+        settings_path.parent.mkdir(parents=True)
+
+        def commit_receipt_fails(staged, path):
+            if path == str(state_path):
+                os.unlink(staged)
+                raise OSError("receipt rename failed")
+            commit_staged_json(staged, path)
+
+        with pytest.raises(ClaudeSettingsError, match="receipt rename failed"):
+            configure_claude_settings(
+                "http://127.0.0.1:4000",
+                StaticToken("sk-never-orphaned"),
+                StartOn("claude-auto"),
+                settings_path,
+                state_path,
+                (),
+                commit=commit_receipt_fails,
+            )
+        assert not settings_path.exists()
+        assert not list(settings_path.parent.glob(".tmp-*"))
+        assert not state_path.exists()
+
+    def test_a_key_the_user_edited_between_two_configures_stays_theirs(self, paths, state_path):
+        # A repeat configure (a re-login is one) must not adopt the user's edit as its own write and
+        # then delete it on unconfigure.
+        settings_path, _ = paths
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_text(json.dumps(self.ORIGINAL))
+        self._configure(paths, state_path, model="claude-auto")
+        edited = json.loads(settings_path.read_text())
+        edited["model"] = "my-favourite"
+        edited["env"]["ENABLE_TOOL_SEARCH"] = "false"
+        settings_path.write_text(json.dumps(edited))
+        self._configure(paths, state_path, model=None, credential=ApiKeyHelper("lite auth print-token"))
+        between = json.loads(settings_path.read_text())
+        assert between["model"] == "my-favourite" and between["env"]["ENABLE_TOOL_SEARCH"] == "false"
+
+        outcome = unconfigure_claude_settings(settings_path, state_path, ())
+        after = json.loads(settings_path.read_text())
+        assert after["model"] == "my-favourite" and after["env"]["ENABLE_TOOL_SEARCH"] == "false"
+        assert after["env"]["ANTHROPIC_API_KEY"] == "sk-ant-mine" and "apiKeyHelper" in after
+        assert {"model", "env.ENABLE_TOOL_SEARCH"} <= set(outcome.kept)
+
+    def test_unconfigure_refuses_when_env_became_a_scalar(self, paths, state_path):
+        settings_path, _ = paths
+        self._configure(paths, state_path)
+        settings_path.write_text(json.dumps({"env": "oops", "model": "claude-auto"}))
+        with pytest.raises(ClaudeSettingsError, match="non-object"):
+            unconfigure_claude_settings(settings_path, state_path, ())
+        assert state_path.exists()
+
     def test_configure_writes_through_a_symlinked_settings_file(self, tmp_path, state_path):
         target = tmp_path / "dotfiles" / "settings.json"
         target.parent.mkdir()
@@ -716,3 +772,9 @@ class TestConfigureAndUnconfigure:
         settings_path, _ = paths
         with pytest.raises(ClaudeSettingsError, match="nothing to undo"):
             unconfigure_claude_settings(settings_path, state_path, ())
+
+
+def test_claude_config_dir_relocates_the_settings_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "profiles" / "work"))
+    assert claude_config_dir() == tmp_path / "profiles" / "work"
+

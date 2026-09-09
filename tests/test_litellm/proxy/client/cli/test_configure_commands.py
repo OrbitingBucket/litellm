@@ -5,10 +5,12 @@ import stat
 import click
 import pytest
 import responses
+import tomlkit
 from click.testing import CliRunner
 
 from litellm.proxy.client.cli import cli
 from litellm.proxy.client.cli.commands import configure as configure_module
+from litellm.proxy.client.cli.commands.claude_settings import claude_config_dir
 from litellm.proxy.client.cli.commands.configure import configure_claude, configure_group, interactive_configure
 
 PROXY = "http://proxy.test:4000"
@@ -23,6 +25,10 @@ def _mock_models():
         match=[responses.matchers.header_matcher({"Authorization": f"Bearer {VALID_KEY}"})],
     )
     responses.get(f"{PROXY}/v1/models", status=401)
+    responses.get(
+        f"{PROXY}/model_group/info",
+        json={"data": [{"model_group": "claude-auto", "max_input_tokens": 200000, "max_output_tokens": 64000}]},
+    )
 
 
 @pytest.fixture
@@ -31,7 +37,23 @@ def paths(monkeypatch, tmp_path):
     state_path = tmp_path / "litellm" / "claude_configure_state.json"
     monkeypatch.setattr(configure_module, "CLAUDE_SETTINGS_PATH", settings_path)
     monkeypatch.setattr(configure_module, "CONFIGURE_STATE_PATH", state_path)
+    monkeypatch.setattr(configure_module, "CODEX_CONFIG_PATH", tmp_path / "codex" / "config.toml")
+    monkeypatch.setattr(configure_module, "CODEX_CONFIGURE_STATE_PATH", tmp_path / "litellm" / "codex_state.json")
     return settings_path, state_path
+
+
+@pytest.fixture
+def launches(monkeypatch):
+    """Record hand-offs instead of replacing the test process with an agent."""
+    calls = []
+    monkeypatch.setattr(
+        configure_module,
+        "launch_agent",
+        lambda base_url, key, binary, skip_verify, started_interactive: calls.append(
+            (base_url, key, binary, skip_verify, started_interactive)
+        ),
+    )
+    return calls
 
 
 @pytest.fixture
@@ -120,9 +142,46 @@ class TestConfigureClaudeWithAVirtualKey:
         assert json.loads(target.read_text())["env"]["ANTHROPIC_AUTH_TOKEN"] == VALID_KEY
 
 
+class TestConfigureCodex:
+    @responses.activate
+    def test_writes_the_provider_and_pins_the_model_with_its_context_window(self, runner, paths, tmp_path):
+        _mock_models()
+        result = runner.invoke(
+            cli, ["--base-url", PROXY, "configure", "codex", "--api-key", VALID_KEY, "--model", "claude-auto"]
+        )
+        assert result.exit_code == 0, result.output
+        doc = tomlkit.parse((tmp_path / "codex" / "config.toml").read_text()).unwrap()
+        assert doc["model_provider"] == "litellm" and doc["model"] == "claude-auto"
+        assert doc["model_context_window"] == 200000
+        assert doc["model_providers"]["litellm"]["base_url"] == f"{PROXY}/v1"
+        assert doc["model_providers"]["litellm"]["experimental_bearer_token"] == VALID_KEY
+        assert VALID_KEY not in result.output
+        assert "context window 200000 tokens" in result.output
+        assert "lite unconfigure codex" in result.output
+
+    @responses.activate
+    def test_unconfigure_codex_restores_the_file(self, runner, paths, tmp_path):
+        _mock_models()
+        config_path = tmp_path / "codex" / "config.toml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text('model = "gpt-6-astra"\n')
+        assert runner.invoke(cli, ["--base-url", PROXY, "configure", "codex", "--api-key", VALID_KEY]).exit_code == 0
+        result = runner.invoke(cli, ["unconfigure", "codex"])
+        assert result.exit_code == 0, result.output
+        assert tomlkit.parse(config_path.read_text()).unwrap() == {"model": "gpt-6-astra"}
+
+    @responses.activate
+    def test_launch_hands_off_to_the_agent_after_configuring(self, runner, paths, launches):
+        _mock_models()
+        result = runner.invoke(cli, ["--base-url", PROXY, "configure", "codex", "--api-key", VALID_KEY, "--launch"])
+        assert result.exit_code == 0, result.output
+        assert launches == [(PROXY, VALID_KEY, "codex", True, False)]
+        assert len(responses.calls) == 1
+
+
 class TestConfigureClaudeWithTheLogin:
     def _stored_login(self, monkeypatch):
-        monkeypatch.setattr(configure_module, "ensure_fresh_login", lambda ctx: None)
+        monkeypatch.setattr(configure_module, "ensure_fresh_login", lambda ctx, reader: None)
         monkeypatch.setattr(configure_module, "get_stored_api_key", lambda expected_base_url, vault: VALID_KEY)
 
     @responses.activate
@@ -141,7 +200,7 @@ class TestConfigureClaudeWithTheLogin:
         assert "ANTHROPIC_AUTH_TOKEN" not in written["env"]
         assert written["model"] == "claude-auto"
         assert VALID_KEY not in settings_path.read_text()
-        assert "read through apiKeyHelper" in result.output
+        assert "lite auth print-token" in result.output
 
     @responses.activate
     def test_an_explicit_key_still_wins_over_a_stored_login(self, runner, paths, monkeypatch, lite_on_path):
@@ -165,19 +224,44 @@ class TestInteractiveConfigure:
         settings_path, _ = paths
         asked = {}
 
-        def pick_model(listed):
+        def pick_model(agent, listed):
             asked["listed"] = tuple(listed)
             return "claude-auto"
 
-        ctx = click.Context(configure_group, obj={"base_url": PROXY, "api_key": VALID_KEY, "api_key_from_token_file": False})
-        interactive_configure(ctx, pick_targets=lambda: ("claude",), pick_model=pick_model)
+        ctx = click.Context(
+            configure_group, obj={"base_url": PROXY, "api_key": VALID_KEY, "api_key_from_token_file": False}
+        )
+        interactive_configure(
+            ctx, pick_targets=lambda: ("claude",), pick_model=pick_model, confirm_launch=lambda agent: False
+        )
         assert asked["listed"] == LISTED_MODELS
         assert json.loads(settings_path.read_text())["model"] == "claude-auto"
 
+    @responses.activate
+    def test_configures_every_picked_agent_and_starts_the_confirmed_one(self, paths, tmp_path, launches):
+        _mock_models()
+        settings_path, _ = paths
+        ctx = click.Context(
+            configure_group, obj={"base_url": PROXY, "api_key": VALID_KEY, "api_key_from_token_file": False}
+        )
+        interactive_configure(
+            ctx,
+            pick_targets=lambda: ("claude", "codex"),
+            pick_model=lambda agent, listed: "claude-auto" if agent == "codex" else None,
+            confirm_launch=lambda agent: agent == "codex",
+            launch=lambda session, agent: launches.append((session.base_url, session.key, agent)),
+        )
+        assert "model" not in json.loads(settings_path.read_text())
+        assert tomlkit.parse((tmp_path / "codex" / "config.toml").read_text()).unwrap()["model"] == "claude-auto"
+        assert launches == [(PROXY, VALID_KEY, "codex")]
+        assert [c.request.path_url.split("?")[0] for c in responses.calls] == ["/v1/models", "/model_group/info"]
+
     def test_does_nothing_when_claude_code_is_not_picked(self, paths):
         settings_path, _ = paths
-        ctx = click.Context(configure_group, obj={"base_url": PROXY, "api_key": VALID_KEY, "api_key_from_token_file": False})
-        interactive_configure(ctx, pick_targets=lambda: (), pick_model=lambda listed: None)
+        ctx = click.Context(
+            configure_group, obj={"base_url": PROXY, "api_key": VALID_KEY, "api_key_from_token_file": False}
+        )
+        interactive_configure(ctx, pick_targets=lambda: (), pick_model=lambda agent, listed: None)
         assert not settings_path.exists()
 
     def test_bare_configure_without_a_terminal_names_the_non_interactive_command(self, runner, paths):
