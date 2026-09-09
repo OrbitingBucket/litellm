@@ -102,10 +102,10 @@ from litellm.proxy.management_endpoints.common_utils import (
     _is_user_org_admin_for_team,
     _is_user_team_admin,
     _set_object_metadata_field,
-    _team_member_has_permission,
     _update_metadata_fields,
     _upsert_budget_and_membership,
     _user_has_admin_view,
+    team_member_has_permission,
     validate_budget_duration,
 )
 from litellm.proxy.management_endpoints.organization_endpoints import (
@@ -5574,11 +5574,28 @@ async def team_model_add(
             detail={"error": "Only proxy admin or team admin can modify team models"},
         )
 
+    return await add_models_to_team(
+        team_id=data.team_id,
+        models=data.models,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        proxy_logging_obj=proxy_logging_obj,
+    )
+
+
+async def add_models_to_team(
+    team_id: str,
+    models: Sequence[str],
+    prisma_client: PrismaClient,
+    user_api_key_cache: UserApiKeyCache,
+    proxy_logging_obj: ProxyLogging,
+) -> "prisma_models.LiteLLM_TeamTable":
+    """Register public model names on a team. The caller owns the authorization decision."""
     # Atomic array append with dedup at the database level so concurrent
     # BYOK model creates don't overwrite each other's team.models entries.
     # When the team currently has models=[] (unrestricted access), the
     # CASE expression inserts the 'all-proxy-models' sentinel first.
-    models_to_add: Final = list(data.models)
+    models_to_add: Final = list(models)
     await prisma_client.db.execute_raw(
         'UPDATE "LiteLLM_TeamTable" '
         "SET models = ("
@@ -5591,7 +5608,7 @@ async def team_model_add(
         ") "
         "WHERE team_id = $2",
         models_to_add,
-        data.team_id,
+        team_id,
     )
     # Re-fetch via update (write-routed) instead of find_unique (read-routed)
     # to avoid returning stale data from a read replica. The models column
@@ -5600,14 +5617,14 @@ async def team_model_add(
     # `include` mirrors the relations the auth path consumes off the cached
     # team object so that `_refresh_cached_team` doesn't null them out.
     updated_team: Final = await _team_db(prisma_client).update(
-        where={"team_id": data.team_id},
+        where={"team_id": team_id},
         data={"updated_at": datetime.now(timezone.utc)},
         include={"litellm_model_table": True, "object_permission": True},
     )
     if updated_team is None:
         raise HTTPException(
             status_code=404,
-            detail={"error": f"Team not found, passed team_id={data.team_id}"},
+            detail={"error": f"Team not found, passed team_id={team_id}"},
         )
 
     await _refresh_cached_team(
@@ -5617,20 +5634,6 @@ async def team_model_add(
     )
 
     return updated_team
-
-
-def shrink_team_models(current_models: Sequence[str], removed: Sequence[str]) -> tuple[str, ...]:
-    """``team.models`` after dropping ``removed``, without ever falling to the all-access empty list.
-
-    An empty ``team.models`` is read by the access check as "every model", so removing a
-    restricted team's last name must leave a list that grants nothing rather than everything.
-    ``no-default-models`` names nothing any resolver serves, so it is that list. A team that
-    was already ``[]`` (unrestricted on purpose) is left as it is.
-    """
-    kept: Final = tuple(m for m in current_models if m not in removed)
-    if kept or not current_models:
-        return kept
-    return (SpecialModelNames.no_default_models.value,)
 
 
 @router.post(
@@ -5693,18 +5696,49 @@ async def team_model_delete(
             detail={"error": "Only proxy admin or team admin can modify team models"},
         )
 
-    updated_models: Final = list(shrink_team_models(team_obj.models or (), data.models))
+    return await remove_models_from_team(
+        team_obj=team_obj,
+        models=data.models,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        proxy_logging_obj=proxy_logging_obj,
+    )
 
-    # Update team. See team_model_add for the rationale on `include`.
+
+def shrink_team_models(current_models: Sequence[str], removed: Sequence[str]) -> tuple[str, ...]:
+    """``team.models`` after dropping ``removed``, without ever falling to the all-access empty list.
+
+    An empty ``team.models`` is read by the access check as "every model", so removing a
+    restricted team's last name must leave a list that grants nothing rather than everything.
+    ``no-default-models`` names nothing any resolver serves, so it is that list. A team that
+    was already ``[]`` (unrestricted on purpose) is left as it is.
+    """
+    kept: Final = tuple(m for m in current_models if m not in removed)
+    if kept or not current_models:
+        return kept
+    return (SpecialModelNames.no_default_models.value,)
+
+
+async def remove_models_from_team(
+    team_obj: LiteLLM_TeamTable,
+    models: Sequence[str],
+    prisma_client: PrismaClient,
+    user_api_key_cache: UserApiKeyCache,
+    proxy_logging_obj: ProxyLogging,
+) -> "prisma_models.LiteLLM_TeamTable":
+    """Drop public model names from a team. The caller owns the authorization decision."""
+    updated_models: Final = list(shrink_team_models(team_obj.models or (), models))
+
+    # See add_models_to_team for the rationale on `include`.
     updated_team: Final = await _team_db(prisma_client).update(
-        where={"team_id": data.team_id},
+        where={"team_id": team_obj.team_id},
         data={"models": updated_models},
         include={"litellm_model_table": True, "object_permission": True},
     )
     if updated_team is None:
         raise HTTPException(
             status_code=404,
-            detail={"error": f"Team not found, passed team_id={data.team_id}"},
+            detail={"error": f"Team not found, passed team_id={team_obj.team_id}"},
         )
 
     await _refresh_cached_team(
@@ -6064,7 +6098,7 @@ async def _resolve_team_daily_activity_scope(
         for team_alias in team_aliases:
             team_obj = LiteLLM_TeamTable.model_validate(team_alias.model_dump())
             is_admin = _is_user_team_admin(user_api_key_dict=user_api_key_dict, team_obj=team_obj)
-            has_perm = _team_member_has_permission(
+            has_perm = team_member_has_permission(
                 user_api_key_dict=user_api_key_dict,
                 team_obj=team_obj,
                 permission="/team/daily/activity",
