@@ -876,6 +876,7 @@ def _decision_is_pinnable(decision: StandardLoggingRoutingDecision | None) -> bo
             "modality_escalation",
             "modality_pin_override",
             "health_failover",
+            "health_default_fallback",
         )
         and not decision.get("context_escalated")
         and _CLASSIFIER_CIRCUIT_OPEN_SIGNAL not in (decision.get("signals") or ())
@@ -2944,8 +2945,10 @@ class ComplexityRouter(CustomLogger):
                 messages=messages,
                 input=input,
                 parent_otel_span=_get_parent_otel_span_from_kwargs(request_kwargs),
+                health_check_probe=True,
             )
-        except (RouterRateLimitError, RouterRateLimitErrorBasic, BadRequestError):
+        except (RouterRateLimitError, RouterRateLimitErrorBasic, BadRequestError) as exc:
+            verbose_router_logger.debug("health probe unavailable model=%s error=%s", model_name, type(exc).__name__)
             return False
         except Exception as exc:  # noqa: BLE001  # a speculative eligibility read must fail open on unknown faults
             verbose_router_logger.debug(
@@ -2985,8 +2988,6 @@ class ComplexityRouter(CustomLogger):
         if decision is None or not isinstance(decided_tier, str):
             return response
         peers: Final = tuple(self._tier_pools().get(decided_tier, ()))
-        if len(peers) < 2:
-            return response
         if await self._model_group_can_serve(response.model, messages, input, request_kwargs):
             return response
         eligible: Final = (
@@ -2997,40 +2998,75 @@ class ComplexityRouter(CustomLogger):
         candidates: Final = tuple(
             peer for peer in peers if peer != response.model and (eligible is None or peer in eligible)
         )
-        if not candidates:
-            return response
         servable: Final = await asyncio.gather(
             *(self._model_group_can_serve(peer, messages, input, request_kwargs) for peer in candidates)
         )
         live: Final = tuple(peer for peer, can_serve in zip(candidates, servable) if can_serve)
-        if not live:
-            return response
-        repick_messages: Final = (
-            list(resolved_messages) if resolved_messages else None  # mutable-ok: the pick's param is list-typed
-        )
-        try:
-            new_model: Final = await self._pick_model_for_tier(
-                decided_tier if self.config.has_custom_tiers else ComplexityTier(decided_tier),
-                messages,
-                repick_messages,  # pyright: ignore[reportArgumentType]  # hook-resolved message dicts; the pick only reads them
-                request_kwargs,
-                allowed_models=live,
+        if live:
+            repick_messages: Final = (
+                list(resolved_messages) if resolved_messages else None  # mutable-ok: the pick's param is list-typed
             )
-        except ValueError as exc:
-            verbose_router_logger.debug(
-                "ComplexityRouter: health failover found no candidate the routing plugins allow: %s", exc
-            )
+            try:
+                new_model: Final = await self._pick_model_for_tier(
+                    decided_tier if self.config.has_custom_tiers else ComplexityTier(decided_tier),
+                    messages,
+                    repick_messages,  # pyright: ignore[reportArgumentType]  # hook-resolved message dicts; the pick only reads them
+                    request_kwargs,
+                    allowed_models=live,
+                )
+            except ValueError as exc:
+                verbose_router_logger.debug(
+                    "ComplexityRouter: health failover found no candidate the routing plugins allow: %s", exc
+                )
+            else:
+                self._restamp_adaptive_choice(request_kwargs, response.model, new_model)
+                verbose_router_logger.info(
+                    "ComplexityRouter: routing decision cause=health_failover, routed_model=%s, displaced=%s",
+                    new_model,
+                    response.model,
+                )
+                new_decision: Final = self._build_routing_decision(
+                    routed_model=new_model,
+                    cause="health_failover",
+                    tier=decision.get("tier"),
+                    score=decision.get("score"),
+                    signals=(*(decision.get("signals") or ()), f"health_displaced:{response.model}"),
+                    matched_keyword=decision.get("matched_keyword"),
+                    escalation_keyword=decision.get("escalation_keyword"),
+                    escalated=bool(decision.get("escalated", False)),
+                    classifier_model=decision.get("classifier_model"),
+                    classifier_cost=decision.get("classifier_cost"),
+                    conversation_continuing=bool(decision.get("conversation_continuing", True)),
+                    tier_litellm_params=self._litellm_params_for_model(decided_tier, new_model),
+                    context_escalation_original_tier=decision.get("context_escalation_original_tier"),
+                )
+                return response.model_copy(
+                    update={  # mutable-ok: model_copy types update as a plain dict
+                        "model": new_model,
+                        "litellm_params": self._litellm_params_for_model(decided_tier, new_model),
+                        "routing_decision": new_decision,
+                    }
+                )
+        default_model: Final = self.config.default_model
+        plan_mode_active: Final = self._matched_plan_mode_signal(request_kwargs, resolved_messages) is not None
+        if (
+            plan_mode_active
+            or self.config.plugins
+            or not default_model
+            or default_model == response.model
+            or (eligible is not None and default_model not in eligible)
+            or not await self._model_group_can_serve(default_model, messages, input, request_kwargs)
+        ):
             return response
-        self._restamp_adaptive_choice(request_kwargs, response.model, new_model)
+        self._restamp_adaptive_choice(request_kwargs, response.model, default_model)
         verbose_router_logger.info(
-            "ComplexityRouter: routing decision cause=health_failover, routed_model=%s, displaced=%s",
-            new_model,
+            "ComplexityRouter: routing decision cause=health_default_fallback, routed_model=%s, displaced=%s",
+            default_model,
             response.model,
         )
-        new_decision: Final = self._build_routing_decision(
-            routed_model=new_model,
-            cause="health_failover",
-            tier=decision.get("tier"),
+        default_decision: Final = self._build_routing_decision(
+            routed_model=default_model,
+            cause="health_default_fallback",
             score=decision.get("score"),
             signals=(*(decision.get("signals") or ()), f"health_displaced:{response.model}"),
             matched_keyword=decision.get("matched_keyword"),
@@ -3039,14 +3075,14 @@ class ComplexityRouter(CustomLogger):
             classifier_model=decision.get("classifier_model"),
             classifier_cost=decision.get("classifier_cost"),
             conversation_continuing=bool(decision.get("conversation_continuing", True)),
-            tier_litellm_params=self._litellm_params_for_model(decided_tier, new_model),
+            tier_litellm_params=self._litellm_params_for_model(None, default_model),
             context_escalation_original_tier=decision.get("context_escalation_original_tier"),
         )
         return response.model_copy(
-            update={  # mutable-ok: model_copy types update as a plain dict
-                "model": new_model,
-                "litellm_params": self._litellm_params_for_model(decided_tier, new_model),
-                "routing_decision": new_decision,
+            update={
+                "model": default_model,
+                "litellm_params": self._litellm_params_for_model(None, default_model),
+                "routing_decision": default_decision,
             }
         )
 

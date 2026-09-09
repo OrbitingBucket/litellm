@@ -270,6 +270,11 @@ change or default takeover records `cause: modality_escalation` with the displac
 pinned by session affinity, and by default a KEPT session pin bypasses the gate: a session pinned
 to a text-only model keeps it even when an image arrives.
 
+When health-check routing marks every deployment in the selected tier unavailable, the router first
+tries another healthy model in that tier. If none exists, it uses `default_model` when configured,
+servable, and no routing plugin is active. The decision records `cause: health_default_fallback`
+with `health_displaced:<MODEL>` in `signals`; this replacement is transient and is not pinned
+
 Add `modality_pin_override: true` to lift that last exemption. The image turn is then re-placed
 the same way every other decision is, and records `cause: modality_pin_override` whether or not
 the tier moved, since the model left the pin either way. The pin itself is untouched: the session
