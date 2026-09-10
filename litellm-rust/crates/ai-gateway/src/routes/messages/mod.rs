@@ -118,12 +118,7 @@ impl IntoResponse for MessagesRouteError {
             | Error::Connect(_)
             | Error::InvalidResponse(_)
             | Error::InvalidType { .. }
-            | Error::MissingField(_)
-            | Error::MissingMistralApiKey
-            | Error::MissingAzureAiCredentials
-            | Error::MissingAzureAiCredentialsOrAdToken
-            | Error::MissingAzureDocumentIntelligenceCredentials
-            | Error::MissingReductoApiKey => (
+            | Error::MissingField(_) => (
                 StatusCode::BAD_GATEWAY,
                 "messages provider request failed".to_string(),
             ),
