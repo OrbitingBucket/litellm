@@ -68,7 +68,7 @@ pub(crate) fn resolve_wire_adapter(
         }
         OcrProvider::Reducto => Ok((provider.model.to_string(), OcrAdapterKind::ReductoV3)),
         OcrProvider::VertexAi if provider.model.to_ascii_lowercase().contains("deepseek") => {
-            Err(Error::Unsupported("Vertex DeepSeek OCR"))
+            Ok((provider.model.to_string(), OcrAdapterKind::VertexDeepSeek))
         }
         OcrProvider::VertexAi => Ok((provider.model.to_string(), OcrAdapterKind::VertexMistral)),
     }

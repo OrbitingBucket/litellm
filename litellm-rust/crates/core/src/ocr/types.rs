@@ -10,12 +10,6 @@ use crate::Error;
 use crate::constants::OCR_HTTP_TIMEOUT_SECS;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct OcrRequestData {
-    pub data: Value,
-    pub files: Option<Value>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum OcrDocument {
     #[serde(rename = "document_url")]
