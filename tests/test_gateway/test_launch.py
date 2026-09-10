@@ -3,6 +3,7 @@ import socket
 import sys
 import textwrap
 import urllib.parse
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Final, cast
 
@@ -63,12 +64,13 @@ def _query(url: str) -> dict[str, str]:
 
 
 @pytest.fixture
-def password_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+def password_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, str]]:
     for var in ("DATABASE_URL", "IAM_TOKEN_DB_AUTH", "AZURE_POSTGRESQL_AUTH", "DATABASE_HOST_READ_REPLICA"):
         monkeypatch.delenv(var, raising=False)
     for var, value in DB_ENV.items():
         monkeypatch.setenv(var, value)
-    return dict(DB_ENV)
+    yield dict(DB_ENV)
+    os.environ.pop("DATABASE_URL", None)
 
 
 def _uvicorn_params(argv: tuple[str, ...]) -> dict[str, object]:
