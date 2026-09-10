@@ -43,7 +43,6 @@ pub(crate) fn chat_completions_error_to_pyerr(err: Error) -> PyErr {
         | Error::MissingField(_)
         | Error::MissingMistralApiKey
         | Error::MissingAzureAiCredentials
-        | Error::MissingAzureAiCredentialsOrAdToken
         | Error::MissingAzureDocumentIntelligenceCredentials
         | Error::MissingReductoApiKey
         | Error::Routing(_)
