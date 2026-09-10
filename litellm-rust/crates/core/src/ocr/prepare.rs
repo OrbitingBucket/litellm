@@ -4,13 +4,16 @@ use serde_json::{Map, Value};
 use super::OcrClient;
 use super::error::{OcrError, OcrRequestError};
 use super::hooks::OcrDuringCallRequest;
+use super::registry::OcrAdapterKind;
 use super::types::{LiteLLMOcrRequest, OcrRequestFormat};
 
 #[tracing::instrument(target = "litellm::function_trace", level = "trace", skip_all)]
 pub(crate) fn _prepare_ocr_request<T: DeserializeOwned>(
     request: &LiteLLMOcrRequest,
 ) -> Result<T, OcrRequestError> {
-    if request.request_format()? == OcrRequestFormat::Native {
+    if request.request_format()? == OcrRequestFormat::Native
+        && request.adapter != OcrAdapterKind::AzureDocumentIntelligence
+    {
         return Err(OcrRequestError::NativeUnsupported(
             request.adapter.provider().as_str(),
         ));
