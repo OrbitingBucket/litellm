@@ -8,9 +8,11 @@ event follows ``LITELLM_SPEND_WORKER_ON_UNAVAILABLE``: ``fallback`` runs the exi
 the worker, ``drop`` counts it and moves on. Transitions are logged with the counters, so a sidecar
 outage is visible without scraping anything.
 
-Delivery is at-most-once: a sidecar crash loses the events already handed to its socket. Events from
-one uvicorn worker are handled in the order it produced them; events from different workers interleave,
-exactly like the in-process callbacks do today.
+Delivery is at-most-once: a sidecar crash loses the events already handed to its socket. A sidecar
+that stops gracefully half-closes each connection first (EOF towards the producer) and keeps reading
+until the producer hangs up, so the producer switches to the unavailable policy without losing the
+events in flight. Events from one uvicorn worker are handled in the order it produced them; events
+from different workers interleave, exactly like the in-process callbacks do today.
 """
 
 import asyncio
@@ -120,6 +122,16 @@ def build_spend_event_producer(
 
 
 @dataclass(frozen=True, slots=True)
+class _Connection:
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
+
+    @property
+    def alive(self) -> bool:
+        return not self.writer.is_closing() and not self.reader.at_eof()
+
+
+@dataclass(frozen=True, slots=True)
 class SpendEventProducerStats:
     queued: int
     sent: int
@@ -148,7 +160,7 @@ class SpendEventProducer:
         self._clock = clock
         self._queue: asyncio.Queue[bytes] | None = None
         self._writer_task: asyncio.Task[None] | None = None
-        self._writer: asyncio.StreamWriter | None = None
+        self._connection: _Connection | None = None
         self._closing = False
         self._next_connect_at = 0.0
         self._queued = 0
@@ -162,7 +174,7 @@ class SpendEventProducer:
             sent=self._sent,
             fallback=self._fallback_count,
             dropped=self._dropped,
-            connected=self._writer is not None,
+            connected=self._connection is not None,
         )
 
     async def publish(self, line: bytes) -> PublishOutcome:
@@ -215,27 +227,28 @@ class SpendEventProducer:
                 queue.task_done()
 
     async def _send(self, line: bytes) -> None:
-        writer: Final = await self._connect()
-        if writer is None:
+        connection: Final = await self._connect()
+        if connection is None:
             await self._unavailable(line, "sidecar unreachable")
             return
         try:
-            writer.write(line)
-            await writer.drain()
-        except (ConnectionError, OSError) as error:
+            connection.writer.write(line)
+            await connection.writer.drain()
+        except (ConnectionError, OSError, RuntimeError) as error:  # uvloop: RuntimeError on a closed transport
             await self._disconnect()
             self._next_connect_at = self._clock() + RECONNECT_BACKOFF_SECONDS
             await self._unavailable(line, f"write failed: {error}")
             return
         self._sent += 1
 
-    async def _connect(self) -> asyncio.StreamWriter | None:
-        if self._writer is not None:
-            return self._writer
+    async def _connect(self) -> _Connection | None:
+        if self._connection is not None and self._connection.alive:
+            return self._connection
+        await self._disconnect()
         if self._clock() < self._next_connect_at:
             return None
         try:
-            _, writer = await open_spend_worker_connection(self._address, self._connect_timeout)
+            reader, writer = await open_spend_worker_connection(self._address, self._connect_timeout)
         except (ConnectionError, OSError, asyncio.TimeoutError) as error:
             self._next_connect_at = self._clock() + RECONNECT_BACKOFF_SECONDS
             verbose_proxy_logger.warning(
@@ -247,18 +260,18 @@ class SpendEventProducer:
                 self.stats(),
             )
             return None
-        self._writer = writer
+        self._connection = _Connection(reader=reader, writer=writer)
         verbose_proxy_logger.info("spend worker: connected to %s. stats=%s", self._address, self.stats())
-        return writer
+        return self._connection
 
     async def _disconnect(self) -> None:
-        writer: Final = self._writer
-        self._writer = None
-        if writer is None:
+        connection: Final = self._connection
+        self._connection = None
+        if connection is None:
             return
-        writer.close()
+        connection.writer.close()
         try:
-            await writer.wait_closed()
+            await connection.writer.wait_closed()
         except (ConnectionError, OSError):
             pass
 

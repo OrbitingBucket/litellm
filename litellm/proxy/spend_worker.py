@@ -7,8 +7,9 @@ spend logs, spend counters, budget reservation reconciliation and cache updates 
 they would in-process, just in this container. Events are handled in order per producer connection
 (one per uvicorn worker); a slow pipeline fills the socket buffer and the producer's bounded queue,
 which is the backpressure that triggers its fallback or drop policy. ``SIGTERM`` stops accepting
-connections, finishes the events already sent, then runs the proxy shutdown (which flushes the
-buffered spend transactions).
+connections, half-closes every producer connection so the producers switch to their unavailable
+policy, finishes the events already sent, then runs the proxy shutdown (which flushes the buffered
+spend transactions).
 
     LITELLM_JOB_ROLE=spend_worker python -m litellm.proxy.spend_worker [--address unix:///path.sock]
 """
@@ -40,7 +41,7 @@ class SpendEventConsumer:
 
     def __init__(self, handler: Callable[[bytes], Awaitable[None]]) -> None:
         self._handler = handler
-        self._open_connections = 0
+        self._open_connections: set[asyncio.StreamWriter] = set()  # mutable-ok: live producer connections
         self._idle = asyncio.Event()
         self._idle.set()
         self._received = 0
@@ -70,7 +71,7 @@ class SpendEventConsumer:
                 return await asyncio.start_server(self._on_connection, host=host, port=port, limit=MAX_EVENT_BYTES)
 
     async def _on_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        self._open_connections += 1
+        self._open_connections.add(writer)
         self._idle.clear()
         try:
             while line := await reader.readline():
@@ -83,8 +84,8 @@ class SpendEventConsumer:
             verbose_proxy_logger.warning("spend worker: producer connection ended abnormally: %s", error)
         finally:
             writer.close()
-            self._open_connections -= 1
-            if self._open_connections == 0:
+            self._open_connections.discard(writer)
+            if not self._open_connections:
                 self._idle.set()
 
     async def _handle(self, line: bytes) -> None:
@@ -96,15 +97,17 @@ class SpendEventConsumer:
             verbose_proxy_logger.exception("spend worker: spend event failed")
 
     async def drain(self, timeout: float) -> int:
-        """Keep serving the open connections until every producer hangs up, or ``timeout`` seconds pass.
+        """Half-close every producer connection, then keep reading until each producer hangs up or ``timeout``.
 
         Returns how many producer connections were still open when the timeout hit.
         """
+        for writer in tuple(self._open_connections):
+            writer.write_eof()
         try:
             await asyncio.wait_for(self._idle.wait(), timeout)
         except TimeoutError:
             pass
-        return self._open_connections
+        return len(self._open_connections)
 
 
 def _install_stop_signals(loop: asyncio.AbstractEventLoop, stop: asyncio.Event) -> None:

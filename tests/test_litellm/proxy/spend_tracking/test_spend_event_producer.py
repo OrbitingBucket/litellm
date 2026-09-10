@@ -1,8 +1,10 @@
 import asyncio
+from collections.abc import Callable
 from pathlib import Path
 from typing import Final
 
 import pytest
+import uvloop
 
 from litellm.proxy.spend_tracking.spend_event_producer import (
     AddressError,
@@ -22,6 +24,7 @@ class _Sidecar:
         self.path = path
         self.lines: list[bytes] = []  # mutable-ok: test double records what the producer sent
         self._server: asyncio.Server | None = None
+        self._connections: list[asyncio.StreamWriter] = []  # mutable-ok: test double tracks peers to hang up on
 
     async def __aenter__(self) -> "_Sidecar":
         self._server = await asyncio.start_unix_server(self._on_connection, path=str(self.path))
@@ -32,7 +35,17 @@ class _Sidecar:
         self._server.close()
         await self._server.wait_closed()
 
+    async def hang_up(self) -> None:
+        """Exit the way a stopped sidecar does: stop listening and close every producer connection."""
+        assert self._server is not None
+        self._server.close()
+        for connection in self._connections:
+            connection.close()
+            await connection.wait_closed()
+        await self._server.wait_closed()
+
     async def _on_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self._connections.append(writer)
         while line := await reader.readline():
             self.lines.append(line)
         writer.close()
@@ -119,6 +132,32 @@ async def test_unreachable_sidecar_falls_back_in_process_and_backs_off(tmp_path:
     assert fallback.lines == [b"event-1\n", b"event-2\n"]
     stats: Final = producer.stats()
     assert (stats.sent, stats.fallback, stats.dropped, stats.connected) == (0, 2, 0, False)
+
+
+@pytest.mark.parametrize("loop_factory", [asyncio.new_event_loop, uvloop.new_event_loop], ids=["asyncio", "uvloop"])
+def test_sidecar_hang_up_falls_back_instead_of_losing_events(
+    tmp_path: Path, loop_factory: Callable[[], asyncio.AbstractEventLoop]
+):
+    async def scenario() -> tuple[list[bytes], list[bytes], tuple[int, int, int]]:
+        fallback: Final = _Fallback()
+        sidecar: Final = _Sidecar(tmp_path / "spend.sock")
+        async with sidecar:
+            producer: Final = _producer(sidecar.path, fallback)
+            await producer.publish(b"event-1\n")
+            await asyncio.sleep(0.05)
+            await sidecar.hang_up()
+            await asyncio.sleep(0.05)
+            await producer.publish(b"event-2\n")
+            await producer.close(drain_timeout=5.0)
+        stats: Final = producer.stats()
+        return sidecar.lines, fallback.lines, (stats.sent, stats.fallback, stats.dropped)
+
+    with asyncio.Runner(loop_factory=loop_factory) as runner:
+        sidecar_lines, fallback_lines, counts = runner.run(scenario())
+
+    assert sidecar_lines == [b"event-1\n"]
+    assert fallback_lines == [b"event-2\n"]
+    assert counts == (1, 1, 0)
 
 
 @pytest.mark.asyncio

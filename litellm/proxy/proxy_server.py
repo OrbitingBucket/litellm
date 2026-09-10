@@ -932,6 +932,17 @@ def cleanup_router_config_variables():
     heuristic_v1_tuning_baselines = None
 
 
+async def _flush_spend_counters_on_shutdown() -> None:
+    if prisma_client is None:
+        return
+    try:
+        await proxy_logging_obj.db_spend_update_writer.db_update_spend_transaction_handler(
+            prisma_client=prisma_client, n_retry_times=3, proxy_logging_obj=proxy_logging_obj
+        )
+    except Exception as e:  # noqa: BLE001  # shutdown must continue even if the commit fails
+        verbose_proxy_logger.exception("Error flushing spend counters on shutdown: %s", e)
+
+
 async def _flush_spend_logs_queue_on_shutdown() -> None:
     if prisma_client is None:
         return
@@ -1368,6 +1379,8 @@ async def proxy_startup_event(app: FastAPI) -> AsyncGenerator[None, None]:
             verbose_proxy_logger.error("Error stopping DB health watchdog task: %s", e)
 
     await _drain_spend_event_producer_on_shutdown()
+
+    await _flush_spend_counters_on_shutdown()
 
     await _flush_spend_logs_queue_on_shutdown()
 
