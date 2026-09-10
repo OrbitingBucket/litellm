@@ -5,7 +5,7 @@ use super::OcrClient;
 use super::error::{OcrError, OcrRequestError};
 use super::hooks::OcrDuringCallRequest;
 use super::registry::OcrAdapterKind;
-use super::types::{LiteLLMOcrRequest, OcrRequestFormat};
+use super::types::{LiteLLMOcrRequest, OcrDocument, OcrRequestFormat};
 
 #[tracing::instrument(target = "litellm::function_trace", level = "trace", skip_all)]
 pub(crate) fn _prepare_ocr_request<T: DeserializeOwned>(
@@ -75,6 +75,29 @@ pub(crate) fn build_http_request<B: Serialize>(
         .build()
         .map_err(crate::error::TransportError::from)
         .map_err(OcrError::from)
+}
+
+pub(crate) async fn guardrail_document(
+    request: &LiteLLMOcrRequest,
+    url: &str,
+) -> Result<OcrDocument, OcrError> {
+    if !request.hooks.has_guardrails() {
+        return Ok(request.document.clone());
+    }
+    let changed = request
+        .hooks
+        .during_call(OcrDuringCallRequest {
+            model: request.model.clone(),
+            custom_llm_provider: request.adapter.provider().as_str().into(),
+            url: url.into(),
+            body: serde_json::to_value(&request.document).map_err(|_| {
+                OcrRequestError::RequestField {
+                    path: "document".into(),
+                }
+            })?,
+        })
+        .await?;
+    super::wire::decode_request_value(changed.body, "guardrail.document").map_err(OcrError::from)
 }
 
 #[derive(Serialize)]
