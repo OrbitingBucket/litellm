@@ -8,8 +8,10 @@ use super::registry::OcrProvider;
 use super::types::{LiteLLMOcrRequest, LiteLLMOcrResponse};
 use super::wire::DecodedOcrResponse;
 
+mod azure_mistral;
 mod mistral;
 
+pub(crate) use azure_mistral::AzureMistralAdapter;
 pub(crate) use mistral::MistralAdapter;
 
 /// Converts a complete LiteLLM OCR call to provider HTTP and normalizes its response.
@@ -59,6 +61,7 @@ macro_rules! for_each_ocr_adapter {
     ($callback:ident) => {
         $callback! {
             Mistral, $crate::ocr::adapters::MistralAdapter, $crate::ocr::adapters::MistralAdapter, Mistral;
+            AzureMistral, $crate::ocr::adapters::AzureMistralAdapter, $crate::ocr::adapters::AzureMistralAdapter, AzureAi;
         }
     };
 }
