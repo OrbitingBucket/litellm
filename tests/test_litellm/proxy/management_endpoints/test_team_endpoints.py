@@ -54,6 +54,7 @@ from litellm.proxy.management_endpoints.team_endpoints import (
     router,
     team_member_add_duplication_check,
     team_member_delete,
+    shrink_team_models,
     team_member_update,
     update_team,
     validate_team_org_change,
@@ -351,6 +352,28 @@ async def test_validate_team_org_change_member_not_in_org():
     assert exc_info.value.status_code == 403
     assert "not a member of the organization" in str(exc_info.value.detail)
     assert user_id_not_in_org in str(exc_info.value.detail)
+
+
+def test_validate_team_org_change_ignores_the_no_models_sentinel():
+    """A team whose last model was removed carries `no-default-models`; that grants nothing, so a
+    restricted org must not be asked to allow it."""
+    team = MagicMock(spec=LiteLLM_TeamTable)
+    team.organization_id = "old-org"
+    team.models = ["no-default-models", "gpt-4o"]
+    team.max_budget = None
+    team.tpm_limit = None
+    team.rpm_limit = None
+    team.members_with_roles = []
+    organization = MagicMock(spec=LiteLLM_OrganizationTableWithMembers)
+    organization.organization_id = "new-org"
+    organization.models = ["gpt-4o"]
+    organization.litellm_budget_table = None
+    organization.members = []
+    llm_router = Router(
+        model_list=[{"model_name": "gpt-4o", "litellm_params": {"model": "openai/gpt-4o", "api_key": "k"}}]
+    )
+
+    assert validate_team_org_change(team=team, organization=organization, llm_router=llm_router) is True
 
 
 # Test for /team/permissions_list endpoint (GET)
@@ -2071,6 +2094,57 @@ def test_add_new_models_to_team_with_existing_models():
     )
 
     assert updated_models.sort() == ["model1", "model2", "model3", "model4"].sort()
+
+
+# `team.models == []` is read by the access check as every model, so the shrink owner must never
+# produce it from a restricted list: dropping the last name leaves a list that grants nothing.
+# A team that was already [] (unrestricted on purpose) is left alone, and a partial drop is plain
+# filtering.
+@pytest.mark.parametrize(
+    "current, removed, expected",
+    [
+        (("only-model",), ("only-model",), ("no-default-models",)),
+        (("a", "b"), ("a", "b"), ("no-default-models",)),
+        (("a", "b"), ("a",), ("b",)),
+        (("a",), ("never-there",), ("a",)),
+        ((), ("a",), ()),
+        (("no-default-models", "a"), ("a",), ("no-default-models",)),
+    ],
+)
+def test_shrink_team_models_never_falls_to_the_all_access_empty_list(current, removed, expected):
+    assert shrink_team_models(current, removed) == expected
+
+
+@pytest.mark.asyncio
+async def test_team_model_delete_of_the_last_model_writes_the_no_models_sentinel(monkeypatch):
+    """Live-reproduced: POST /team/model/delete on a team's only model wrote `models: []`, after
+    which the team's keys could call every model on the proxy."""
+    from litellm.proxy._types import TeamModelDeleteRequest
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.management_endpoints.team_endpoints import team_model_delete
+
+    async def update(where, data, include=None):
+        return SimpleNamespace(team_id="team-solo", model_dump=lambda: {"team_id": "team-solo", "models": data["models"]})
+
+    prisma_client = MagicMock()
+    prisma_client.db.litellm_teamtable.find_unique = AsyncMock(
+        return_value=SimpleNamespace(model_dump=lambda: {"team_id": "team-solo", "models": ["only-model"]})
+    )
+    prisma_client.db.litellm_teamtable.update = AsyncMock(side_effect=update)
+    cache = UserApiKeyCache()
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", None)
+
+    written = await team_model_delete(
+        data=TeamModelDeleteRequest(team_id="team-solo", models=["only-model"]),
+        http_request=MagicMock(),
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin"),
+    )
+
+    cached_team = await cache.async_get_cache(key="team_id:team-solo", model_type=LiteLLM_TeamTableCachedObj)
+    assert written.model_dump()["models"] == ["no-default-models"]
+    assert cached_team is not None and cached_team.models == ["no-default-models"]
 
 
 @pytest.mark.asyncio

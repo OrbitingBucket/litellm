@@ -1836,7 +1836,8 @@ def validate_team_org_change(
                 },
             )
         else:
-            for model in team.models:
+            granted_models: Final = tuple(m for m in team.models if m != SpecialModelNames.no_default_models.value)
+            for model in granted_models:
                 can_org_access_model(
                     model=model,
                     org_object=organization,
@@ -5618,6 +5619,20 @@ async def team_model_add(
     return updated_team
 
 
+def shrink_team_models(current_models: Sequence[str], removed: Sequence[str]) -> tuple[str, ...]:
+    """``team.models`` after dropping ``removed``, without ever falling to the all-access empty list.
+
+    An empty ``team.models`` is read by the access check as "every model", so removing a
+    restricted team's last name must leave a list that grants nothing rather than everything.
+    ``no-default-models`` names nothing any resolver serves, so it is that list. A team that
+    was already ``[]`` (unrestricted on purpose) is left as it is.
+    """
+    kept: Final = tuple(m for m in current_models if m not in removed)
+    if kept or not current_models:
+        return kept
+    return (SpecialModelNames.no_default_models.value,)
+
+
 @router.post(
     "/team/model/delete",
     tags=["team management"],
@@ -5678,11 +5693,7 @@ async def team_model_delete(
             detail={"error": "Only proxy admin or team admin can modify team models"},
         )
 
-    # Get current models list
-    current_models: Final[Sequence[str]] = team_obj.models or []
-
-    # Remove specified models
-    updated_models: Final = [m for m in current_models if m not in data.models]
+    updated_models: Final = list(shrink_team_models(team_obj.models or (), data.models))
 
     # Update team. See team_model_add for the rationale on `include`.
     updated_team: Final = await _team_db(prisma_client).update(
