@@ -82,8 +82,14 @@ _CAPTURED_IDENTITY_CALL_TYPES: Final[frozenset[str]] = frozenset(
 
 
 class _ProxyDBLogger(CustomLogger):
-    def __init__(self, spend_event_producer: SpendEventProducer | None = None) -> None:
-        super().__init__()
+    def __init__(
+        self,
+        spend_event_producer: SpendEventProducer | None = None,
+        *,
+        turn_off_message_logging: bool = False,
+        message_logging: bool = True,
+    ) -> None:
+        super().__init__(turn_off_message_logging=turn_off_message_logging, message_logging=message_logging)
         self.spend_event_producer = spend_event_producer
 
     async def async_log_success_event(
